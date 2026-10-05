@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -47,6 +48,14 @@ func init() {
 type Handler struct {
 	ConnectionPolicies caddytls.ConnectionPolicies `json:"connection_policies,omitempty"`
 
+	// HandshakeTimeout is how long to wait for the TLS handshake to complete.
+	// It bounds clients that open a connection but never finish the handshake
+	// (no ClientHello, a partial one, or a stall mid-handshake), which would
+	// otherwise hold the connection open until they close it. By default, it
+	// equals 0 and the handshake has no time limit. Negative values are
+	// rejected.
+	HandshakeTimeout caddy.Duration `json:"handshake_timeout,omitempty"`
+
 	ctx    caddy.Context
 	logger *zap.Logger
 }
@@ -61,6 +70,10 @@ func (*Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the module.
 func (t *Handler) Provision(ctx caddy.Context) error {
+	if t.HandshakeTimeout < 0 {
+		return fmt.Errorf("handshake_timeout: %s must not be negative", time.Duration(t.HandshakeTimeout))
+	}
+
 	t.ctx = ctx
 	t.logger = ctx.Logger(t)
 
@@ -95,7 +108,14 @@ func (t *Handler) Handle(cx *layer4.Connection, next layer4.Handler) error {
 	// connection to perform the handshake, and cx might have some
 	// bytes already buffered need to be read first)
 	tlsConn := tls.Server(cx, tlsCfg)
+	handshakeTimeout := time.Duration(t.HandshakeTimeout)
+	if handshakeTimeout > 0 {
+		_ = cx.SetDeadline(time.Now().Add(handshakeTimeout))
+	}
 	err := tlsConn.Handshake()
+	if handshakeTimeout > 0 {
+		_ = cx.SetDeadline(time.Time{})
+	}
 	if err != nil {
 		return err
 	}
@@ -132,6 +152,7 @@ func (t *Handler) Handle(cx *layer4.Connection, next layer4.Handler) error {
 //		connection_policy {
 //			...
 //		}
+//		handshake_timeout <duration>
 //	}
 //	tls
 func (t *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -142,6 +163,7 @@ func (t *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		return d.ArgErr()
 	}
 
+	var hasHandshakeTimeout bool
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		optionName := d.Val()
 		switch optionName {
@@ -151,6 +173,19 @@ func (t *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return err
 			}
 			t.ConnectionPolicies = append(t.ConnectionPolicies, cp)
+		case "handshake_timeout":
+			if hasHandshakeTimeout {
+				return d.Errf("duplicate %s option '%s'", wrapper, optionName)
+			}
+			if d.CountRemainingArgs() != 1 {
+				return d.ArgErr()
+			}
+			d.NextArg()
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("parsing %s option '%s' duration: %v", wrapper, optionName, err)
+			}
+			t.HandshakeTimeout, hasHandshakeTimeout = caddy.Duration(dur), true
 		default:
 			return d.ArgErr()
 		}
